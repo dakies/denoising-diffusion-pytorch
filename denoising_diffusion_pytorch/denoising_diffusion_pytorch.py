@@ -5,6 +5,8 @@ from random import random
 from functools import partial
 from collections import namedtuple
 from multiprocessing import cpu_count
+import wandb
+from torchvision.datasets import FashionMNIST
 
 import torch
 from torch import nn, einsum
@@ -112,11 +114,12 @@ class SinusoidalPosEmb(nn.Module):
     def __init__(self, dim, theta = 10000):
         super().__init__()
         self.dim = dim
+        self.theta=theta
 
     def forward(self, x):
         device = x.device
         half_dim = self.dim // 2
-        emb = math.log(theta) / (half_dim - 1)
+        emb = math.log(self.theta) / (half_dim - 1)
         emb = torch.exp(torch.arange(half_dim, device=device) * -emb)
         emb = x[:, None] * emb[None, :]
         emb = torch.cat((emb.sin(), emb.cos()), dim=-1)
@@ -274,7 +277,7 @@ class Unet(nn.Module):
         sinusoidal_pos_emb_theta = 10000,
         attn_dim_head = 32,
         attn_heads = 4,
-        full_attn = (False, False, False, True),
+        full_attn = (False, False, False, True), 
         flash_attn = False
     ):
         super().__init__()
@@ -801,9 +804,81 @@ class GaussianDiffusion(nn.Module):
 
         img = self.normalize(img)
         return self.p_losses(img, t, *args, **kwargs)
+    
+    def ddim_learn_noise(self, shape, intermediate_outputs, noise_model, loss_fn, optimizer,
+                         return_all_timesteps=False):
+        batch, device, total_timesteps, sampling_timesteps, eta, objective = shape[
+            0], self.device, self.num_timesteps, self.sampling_timesteps, self.ddim_sampling_eta, self.objective
+
+        times = torch.linspace(-1, total_timesteps - 1,
+                               steps=sampling_timesteps + 1)  # [-1, 0, 1, 2, ..., T-1] when sampling_timesteps == total_timesteps
+        times = list(reversed(times.int().tolist()))
+        time_pairs = list(zip(times[:-1], times[1:]))  # [(T-1, T-2), (T-2, T-3), ..., (1, 0), (0, -1)]
+
+        img = torch.randn(shape, device=device)
+        imgs = [img]
+
+        x_start = None
+
+        for time, time_next in tqdm(time_pairs, desc='sampling loop time step'):
+            time_cond = torch.full((batch,), time, device=device, dtype=torch.long)
+            self_cond = x_start if self.self_condition else None
+            pred_noise, x_start, *_ = self.model_predictions(img, time_cond, self_cond, clip_x_start=True,
+                                                             rederive_pred_noise=True)
+            # Extract latent variables. Check shape [b,c,h,w]
+
+            # Predict t
+            noise_level = noise_model(intermediate_outputs['Residual0']['output'],
+                                      intermediate_outputs['Residual1']['output'],
+                                      intermediate_outputs['Residual2']['output'])
+            # Calculate loss
+            loss = loss_fn(noise_level, time_cond / self.num_timesteps)
+            print("pred_noise_level", noise_level)
+            print("noise_level_", time_cond / self.num_timesteps)
+            print(float(loss))
+            # Take Gradient step
+            loss.backward()
+            optimizer.step()
+
+            if time_next < 0:
+                img = x_start
+                imgs.append(img)
+                continue
+
+            alpha = self.alphas_cumprod[time]
+            alpha_next = self.alphas_cumprod[time_next]
+
+            sigma = eta * ((1 - alpha / alpha_next) * (1 - alpha_next) / (1 - alpha)).sqrt()
+            c = (1 - alpha_next - sigma ** 2).sqrt()
+
+            noise = torch.randn_like(img)
+
+            img = x_start * alpha_next.sqrt() + \
+                  c * pred_noise + \
+                  sigma * noise
+
+            imgs.append(img)
+
+        ret = img if not return_all_timesteps else torch.stack(imgs, dim=1)
+
+        ret = self.unnormalize(ret)
+        # Check if latent variables are also changing here
+        return ret
 
 # dataset classes
 
+# Define a custom dataset class
+class FashionMNISTWithoutLabels(torch.utils.data.Dataset):
+    def __init__(self, fashion_mnist_dataset):
+        self.dataset = fashion_mnist_dataset
+
+    def __len__(self):
+        return len(self.dataset)
+
+    def __getitem__(self, index):
+        image, _ = self.dataset[index]  # Get both image and label
+        return image
+    
 class Dataset(Dataset):
     def __init__(
         self,
@@ -863,7 +938,8 @@ class Trainer(object):
         inception_block_idx = 2048,
         max_grad_norm = 1.,
         num_fid_samples = 50000,
-        save_best_and_latest_only = False
+        save_best_and_latest_only = False,
+        logger_tags = None
     ):
         super().__init__()
 
@@ -871,7 +947,8 @@ class Trainer(object):
 
         self.accelerator = Accelerator(
             split_batches = split_batches,
-            mixed_precision = mixed_precision_type if amp else 'no'
+            mixed_precision = mixed_precision_type if amp else 'no',
+            log_with="wandb"
         )
 
         # model
@@ -896,8 +973,19 @@ class Trainer(object):
         self.max_grad_norm = max_grad_norm
 
         # dataset and dataloader
-
-        self.ds = Dataset(folder, self.image_size, augment_horizontal_flip = augment_horizontal_flip, convert_image_to = convert_image_to)
+        transform = T.Compose(
+            [
+                # T.Lambda(maybe_convert_fn),
+                T.Resize(self.image_size),
+                T.RandomHorizontalFlip() if augment_horizontal_flip else nn.Identity(),
+                T.CenterCrop(self.image_size),
+                T.ToTensor(),
+                # T.Normalize(mean=0.5, std=0.5, inplace=True)  # Scale  to [-1,  1] from [0,1]
+            ]
+        )
+        self.ds = FashionMNIST(folder, train=True, transform=transform, download=True)
+        self.ds = FashionMNISTWithoutLabels(self.ds)
+        # self.ds = Dataset(folder, self.image_size, augment_horizontal_flip = augment_horizontal_flip, convert_image_to = convert_image_to)
 
         assert len(self.ds) >= 100, 'you should have at least 100 images in your folder. at least 10k images recommended'
 
@@ -954,6 +1042,14 @@ class Trainer(object):
             self.best_fid = 1e10 # infinite
 
         self.save_best_and_latest_only = save_best_and_latest_only
+        self.accelerator.init_trackers(
+            project_name="DiffusionFashionMNIST",
+            # config={"dropout": 0.1, "learning_rate": 1e-2},
+            init_kwargs={"tags": logger_tags},
+            # init_kwargs = {"wandb": {"entity": "my-wandb-team"}}
+        )
+        self.wandb_tracker = self.accelerator.get_tracker("wandb")
+
 
     @property
     def device(self):
@@ -1015,6 +1111,7 @@ class Trainer(object):
                     self.accelerator.backward(loss)
 
                 pbar.set_description(f'loss: {total_loss:.4f}')
+                accelerator.log({"loss": total_loss})
 
                 accelerator.wait_for_everyone()
                 accelerator.clip_grad_norm_(self.model.parameters(), self.max_grad_norm)
@@ -1039,7 +1136,14 @@ class Trainer(object):
                         all_images = torch.cat(all_images_list, dim = 0)
 
                         utils.save_image(all_images, str(self.results_folder / f'sample-{milestone}.png'), nrow = int(math.sqrt(self.num_samples)))
-
+                        # Log images
+                        wandb_images = [wandb.Image(i)
+                                        for i in all_images_list]
+                        wandb.log(
+                            {
+                                "sampled_images": wandb_images,
+                            }
+                        )
                         # whether to calculate fid
 
                         if self.calculate_fid:
@@ -1049,6 +1153,10 @@ class Trainer(object):
                             if self.best_fid > fid_score:
                                 self.best_fid = fid_score
                                 self.save("best")
+                                trained_artifact = wandb.Artifact(
+                                str(self.results_folder / f"model-best.pt"),
+                                type="model",
+                                )
                             self.save("latest")
                         else:
                             self.save(milestone)
